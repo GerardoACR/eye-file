@@ -13,7 +13,13 @@ from PySide6.QtWidgets import (
     QLabel,
     QPushButton,
     QFrame,
+    QFileDialog,
 )
+
+from shutil import copy2
+
+import os
+
 from PySide6.QtCore import Qt
 
 from pathlib import Path
@@ -25,9 +31,13 @@ from eye_file.data.db import (
     seed_minimal_data,
     get_default_ids,
     insert_note,
+    update_note,
     fetch_categories,
     fetch_note_by_id,
     fetch_notes_for_category_subtree,
+    insert_document,
+    fetch_documents,
+    fetch_document_by_id,
 )
 
 
@@ -68,6 +78,10 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:
         super().__init__()
+
+         # ---- App state (selection) ----
+        self._current_document_id: int | None = None
+        self._current_note_id: int | None = None
 
         # Window metadata
         self.setWindowTitle("EyeFile")
@@ -135,6 +149,13 @@ class MainWindow(QMainWindow):
         # -------------------------
         note_panel, note_layout = build_panel("Note")
 
+        # New note row
+        note_top_row = QHBoxLayout()
+        self.new_note_btn = QPushButton("New note")
+        note_top_row.addWidget(self.new_note_btn)
+        note_top_row.addStretch(1)
+        note_layout.addLayout(note_top_row)
+
         # Excerpt field (plain text)
         note_layout.addWidget(QLabel("Excerpt"))
         self.excerpt_edit = QPlainTextEdit()
@@ -191,10 +212,9 @@ class MainWindow(QMainWindow):
         self._conn = connect(db_path)
         init_db(self._conn, schema_path)
         seed_minimal_data(self._conn)
+        
         self.load_categories_tree()
-
-        # Keep track of what note is currently loaded in the editor (for future "Update" support)
-        self._current_note_id: int | None = None
+        self.refresh_library_list()
 
         # Connect UI events (signals) to handlers (slots)
         self._connect_signals()
@@ -247,25 +267,45 @@ class MainWindow(QMainWindow):
 
         category_id = int(category_id)
 
-        # Keep the document as placeholder for now
-        document_id, _ = get_default_ids(self._conn)
+        # Use the currently selected document (Library).
+        # We require a document selection before saving notes.
+        if self._current_document_id is None:
+            self.statusBar().showMessage("Select a document first (Library).", 4000)
+            return
 
+        document_id = self._current_document_id
 
-        note_id = insert_note(
-            self._conn,
-            document_id=document_id,
-            category_id=category_id,
-            excerpt=excerpt,
-            body_md=body_md,
-            page_ref=page_ref,
-        )
+        # If a note is currently loaded, we update it.
+        # Otherwise, we create a new note (insert).
+        if self._current_note_id is not None:
+            update_note(
+                self._conn,
+                note_id=self._current_note_id,
+                category_id=category_id,
+                excerpt=excerpt,
+                body_md=body_md,
+                page_ref=page_ref,
+            )
+            note_id = self._current_note_id
+            self.statusBar().showMessage(f"Updated ✓ (note_id={note_id})", 4000)
 
-        self.statusBar().showMessage(f"Saved ✓ (note_id={note_id})", 4000)
+        else:
+            note_id = insert_note(
+                self._conn,
+                document_id=document_id,
+                category_id=category_id,
+                excerpt=excerpt,
+                body_md=body_md,
+                page_ref=page_ref,
+            )
+            self._current_note_id = note_id
+            self.statusBar().showMessage(f"Saved ✓ (note_id={note_id})", 4000)
 
-        # Optional: clear editors after saving
-        self.excerpt_edit.clear()
-        self.note_md_edit.clear()
-        self.page_ref_edit.clear()
+            # Optional: clear editor ONLY after inserting a new note (not after update)
+            self.excerpt_edit.clear()
+            self.note_md_edit.clear()
+            self.page_ref_edit.clear()
+
     
         # Refresh the notes list so the new note appears immediately
         self.refresh_notes_list_from_current_category()
@@ -277,7 +317,7 @@ class MainWindow(QMainWindow):
                 self.notes_list.setCurrentItem(it)
                 break
 
-    
+
     def load_categories_tree(self) -> None:
         """
         Load categories from SQLite and rebuild the QTreeWidget.
@@ -329,18 +369,23 @@ class MainWindow(QMainWindow):
         Wire Qt signals (events) to Python methods (handlers).
         Keep all signal hookups in one place to avoid duplicates.
         """
+        # Note editor actions
         self.save_btn.clicked.connect(self.on_save_clicked)
+        self.new_note_btn.clicked.connect(self.on_new_note_clicked)
 
-        # When the selected category changes, refresh the notes list
+        # Category tree -> filter notes list
         self.category_tree.currentItemChanged.connect(self.on_category_changed)
 
-        # When the user clicks a note in the notes list, load it into the editor
+        # Notes list -> load note into editor
         self.notes_list.itemClicked.connect(self.on_note_clicked)
 
+        # Library actions (NEW: Import/Open + selecting a document)
+        self.import_pdf_btn.clicked.connect(self.on_import_pdf_clicked)  
+        self.open_pdf_btn.clicked.connect(self.on_open_pdf_clicked)      
+        self.library_list.itemClicked.connect(self.on_document_clicked)  
         # (Optional / later)
         # self.category_search.textChanged.connect(self.on_category_filter_changed)
         # self.library_search.textChanged.connect(self.on_library_search_changed)
-
 
     def _selected_category_id(self) -> int | None:
         """
@@ -447,5 +492,126 @@ class MainWindow(QMainWindow):
 
         self._current_note_id = note_id
         self.statusBar().showMessage(f"Loaded note_id={note_id}", 2500)
+
+    def on_new_note_clicked(self) -> None:
+        """
+        Reset the editor to 'new note' mode (INSERT).
+        Keeps the currently selected category.
+        """
+        self._current_note_id = None
+        self.excerpt_edit.clear()
+        self.note_md_edit.clear()
+        self.page_ref_edit.clear()
+        self.statusBar().showMessage("New note (INSERT mode)", 2000)
+
+    def refresh_library_list(self) -> None:
+        """Reload documents from DB into the Library list."""
+        self.library_list.clear()
+
+        rows = fetch_documents(self._conn)
+        if not rows:
+            placeholder = QListWidgetItem("No documents yet — click 'Import PDF'")
+            placeholder.setFlags(Qt.NoItemFlags)
+            self.library_list.addItem(placeholder)
+            self.open_pdf_btn.setEnabled(False)
+            self._current_document_id = None
+            return
+
+        for r in rows:
+            doc_id = int(r["id"])
+            title = (r["title"] or "").strip() or "(untitled)"
+            year = r["year"]
+            suffix = f" ({year})" if year else ""
+            item = QListWidgetItem(f"{title}{suffix}")
+            item.setData(Qt.UserRole, doc_id)
+            self.library_list.addItem(item)
+
+
+    def on_import_pdf_clicked(self) -> None:
+        """
+        Import a PDF into app_data/library and create a documents row.
+        """
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import PDF",
+            "",
+            "PDF files (*.pdf)"
+        )
+        if not path:
+            return
+
+        # Where to store inside managed library
+        project_root = Path(__file__).resolve().parents[2]
+        library_dir = project_root / "app_data" / "library"
+        library_dir.mkdir(parents=True, exist_ok=True)
+
+        src = Path(path)
+        dst = library_dir / src.name
+
+        # Avoid overwriting: add suffix if name exists
+        if dst.exists():
+            stem = src.stem
+            ext = src.suffix
+            i = 2
+            while True:
+                candidate = library_dir / f"{stem} ({i}){ext}"
+                if not candidate.exists():
+                    dst = candidate
+                    break
+                i += 1
+
+        copy2(str(src), str(dst))
+
+        # Minimal metadata: title = filename stem
+        title = dst.stem
+        authors = None
+        year = None
+
+        # Store relative path from app_data
+        rel_path = os.path.relpath(dst, project_root / "app_data").replace("\\", "/")
+
+        doc_id = insert_document(self._conn, title=title, authors=authors, year=year, file_rel_path=rel_path)
+
+        self.statusBar().showMessage(f"Imported ✓ (document_id={doc_id})", 4000)
+
+        self.refresh_library_list()
+        # Select imported document
+        for i in range(self.library_list.count()):
+            it = self.library_list.item(i)
+            if it.data(Qt.UserRole) == doc_id:
+                self.library_list.setCurrentItem(it)
+                self.on_document_clicked(it)
+                break
+
+
+    def on_document_clicked(self, item: QListWidgetItem) -> None:
+        """Set current document selection and enable Open."""
+        doc_id = item.data(Qt.UserRole)
+        if doc_id is None:
+            return
+        self._current_document_id = int(doc_id)
+        self.open_pdf_btn.setEnabled(True)
+        self.statusBar().showMessage(f"Selected document_id={self._current_document_id}", 2000)
+
+
+    def on_open_pdf_clicked(self) -> None:
+        """Open selected PDF in system default viewer."""
+        if self._current_document_id is None:
+            return
+
+        row = fetch_document_by_id(self._conn, self._current_document_id)
+        if row is None:
+            self.statusBar().showMessage("Document not found in DB.", 4000)
+            return
+
+        project_root = Path(__file__).resolve().parents[2]
+        app_data_dir = project_root / "app_data"
+        pdf_path = app_data_dir / row["file_rel_path"]
+
+        if not pdf_path.exists():
+            self.statusBar().showMessage(f"File missing: {pdf_path}", 5000)
+            return
+
+        os.startfile(str(pdf_path))
 
 

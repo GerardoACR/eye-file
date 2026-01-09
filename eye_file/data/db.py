@@ -101,6 +101,30 @@ def insert_note(
     conn.commit()
     return int(cur.lastrowid)
 
+def update_note(
+    conn: sqlite3.Connection,
+    note_id: int,
+    category_id: int,
+    excerpt: str,
+    body_md: str,
+    page_ref: str | None,
+) -> None:
+    """
+    Update an existing note by id.
+    """
+    conn.execute(
+        """
+        UPDATE notes
+        SET category_id = ?,
+            excerpt = ?,
+            body_md = ?,
+            page_ref = ?
+        WHERE id = ?
+        """,
+        (category_id, excerpt, body_md, page_ref, note_id),
+    )
+    conn.commit()
+
 def ensure_default_categories(conn: sqlite3.Connection) -> None:
     """
     Ensure a minimal category tree exists.
@@ -175,4 +199,41 @@ def fetch_note_by_id(conn: sqlite3.Connection, note_id: int) -> sqlite3.Row | No
         WHERE id = ?
         """,
         (note_id,),
+    ).fetchone()
+
+def insert_document(conn: sqlite3.Connection, title: str, authors: str | None, year: int | None, file_rel_path: str) -> int:
+    """
+    Insert a document row and return its id.
+    file_rel_path is relative to project app_data (e.g. 'library/abc.pdf').
+    """
+    cur = conn.execute(
+        """
+        INSERT INTO documents (title, authors, year, file_path)
+        VALUES (?, ?, ?, ?)
+        """,
+        (title, authors, year, file_rel_path),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def fetch_documents(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Fetch documents for the Library list."""
+    return conn.execute(
+        """
+        SELECT id, title, authors, year, file_path
+        FROM documents
+        ORDER BY id DESC
+        """
+    ).fetchall()
+
+
+def fetch_document_by_id(conn: sqlite3.Connection, document_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT id, title, authors, year, file_path
+        FROM documents
+        WHERE id = ?
+        """,
+        (document_id,),
     ).fetchone()
